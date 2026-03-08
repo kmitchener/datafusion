@@ -68,6 +68,7 @@ use itertools::Itertools;
 use topk::hash_table::is_supported_hash_key_type;
 use topk::heap::is_supported_heap_type;
 
+pub mod exchange;
 pub mod group_values;
 mod no_grouping;
 pub mod order;
@@ -89,6 +90,8 @@ pub fn topk_types_supported(key_type: &DataType, value_type: &DataType) -> bool 
 /// Hard-coded seed for aggregations to ensure hash values differ from `RepartitionExec`, avoiding collisions.
 const AGGREGATION_HASH_SEED: ahash::RandomState =
     ahash::RandomState::with_seeds('A' as u64, 'G' as u64, 'G' as u64, 'R' as u64);
+
+pub(crate) const GROUP_HASH_FIELD_NAME: &str = "__datafusion_group_hash";
 
 /// Whether an aggregate stage consumes raw input data or intermediate
 /// accumulator state from a previous aggregation stage.
@@ -918,6 +921,48 @@ impl AggregateExec {
         )?))
     }
 
+    pub(crate) fn execute_payload(
+        &self,
+        partition: usize,
+        context: &Arc<TaskContext>,
+    ) -> Result<exchange::SendableAggPayloadStream> {
+        if self.mode != AggregateMode::Partial {
+            return not_impl_err!(
+                "Aggregate payload execution is only supported for Partial mode"
+            );
+        }
+
+        if self.group_by.is_true_no_grouping() {
+            return not_impl_err!(
+                "Aggregate payload execution is not supported for no-grouping aggregates"
+            );
+        }
+
+        if self.limit_options.is_some() {
+            return not_impl_err!(
+                "Aggregate payload execution is not supported for grouped top-k aggregation"
+            );
+        }
+
+        let payload_schema = Arc::new(create_payload_schema(
+            &self.input.schema(),
+            &self.group_by,
+            &self.aggr_expr,
+            self.mode,
+        )?);
+
+        let stream = GroupedHashAggregateStream::new_with_schema(
+            self,
+            context,
+            partition,
+            payload_schema,
+        )?;
+        Ok(Box::pin(exchange::AggPayloadRecordBatchStreamAdapter::new(
+            Box::pin(stream),
+            self.schema(),
+        )))
+    }
+
     /// Finds the DataType and SortDirection for this Aggregate, if there is one
     pub fn get_minmax_desc(&self) -> Option<(FieldRef, bool)> {
         let agg_expr = self.aggr_expr.iter().exactly_one().ok()?;
@@ -1627,6 +1672,34 @@ fn create_schema(
         fields,
         input_schema.metadata().clone(),
     ))
+}
+
+pub(crate) fn group_hash_field() -> FieldRef {
+    Arc::new(Field::new(GROUP_HASH_FIELD_NAME, DataType::UInt64, false))
+}
+
+pub(crate) fn group_hash_column_index(schema: &Schema) -> Option<usize> {
+    schema.fields().last().and_then(|field| {
+        (field.name() == GROUP_HASH_FIELD_NAME && field.data_type() == &DataType::UInt64)
+            .then_some(schema.fields().len() - 1)
+    })
+}
+
+pub(crate) fn create_payload_schema(
+    input_schema: &Schema,
+    group_by: &PhysicalGroupBy,
+    aggr_expr: &[Arc<AggregateFunctionExpr>],
+    mode: AggregateMode,
+) -> Result<Schema> {
+    let schema = create_schema(input_schema, group_by, aggr_expr, mode)?;
+    if matches!(mode.output_mode(), AggregateOutputMode::Partial)
+        && group_by.num_group_exprs() > 0
+    {
+        let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();
+        fields.push(group_hash_field());
+        return Ok(Schema::new_with_metadata(fields, schema.metadata.clone()));
+    }
+    Ok(schema)
 }
 
 /// Determines the lexical ordering requirement for an aggregate expression.

@@ -3679,6 +3679,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hash_agg_group_by_uses_aggregate_exchange() -> Result<()> {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "c1",
+                Arc::new(Int32Array::from(vec![1, 2, 1, 3])) as ArrayRef,
+            ),
+            (
+                "c2",
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+            ),
+        ])?;
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        let ctx = SessionContext::new();
+        let logical_plan = LogicalPlanBuilder::from(
+            ctx.read_table(Arc::new(table))?.into_optimized_plan()?,
+        )
+        .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
+        .build()?;
+
+        let execution_plan = plan(&logical_plan).await?;
+        let formatted = format!("{execution_plan:?}");
+
+        assert!(formatted.contains("FinalPartitioned"));
+        assert!(formatted.contains("AggregateExchangeExec"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn hash_agg_group_by_partitioned_on_dicts() -> Result<()> {
         let dict_array: DictionaryArray<Int32Type> =
             vec!["A", "B", "A", "A", "C", "A"].into_iter().collect();

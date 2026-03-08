@@ -36,6 +36,7 @@ use datafusion_physical_expr_common::sort_expr::{
     PhysicalSortRequirement,
 };
 use datafusion_physical_plan::aggregates::AggregateExec;
+use datafusion_physical_plan::aggregates::exchange::AggregateExchangeExec;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{
@@ -359,6 +360,7 @@ fn pushdown_requirement_to_children(
     } else if maintains_input_order.is_empty()
         || !maintains_input_order.iter().any(|o| *o)
         || plan.as_any().is::<RepartitionExec>()
+        || plan.as_any().is::<AggregateExchangeExec>()
         || plan.as_any().is::<FilterExec>()
         // TODO: Add support for Projection push down
         || plan.as_any().is::<ProjectionExec>()
