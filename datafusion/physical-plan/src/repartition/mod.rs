@@ -75,7 +75,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt, ready};
 use log::trace;
 use parking_lot::Mutex;
 
-mod distributor_channels;
+pub(crate) mod distributor_channels;
 use distributor_channels::{
     DistributionReceiver, DistributionSender, channels, partition_aware_channels,
 };

@@ -44,7 +44,7 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::aggregates::{
-    AggregateExec, AggregateMode, PhysicalGroupBy,
+    AggregateExec, AggregateMode, PhysicalGroupBy, exchange::AggregateExchangeExec,
 };
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::execution_plan::EmissionType;
@@ -408,6 +408,10 @@ pub fn adjust_input_keys_ordering(
             requirements.data.clear();
         }
     } else if plan.as_any().downcast_ref::<RepartitionExec>().is_some()
+        || plan
+            .as_any()
+            .downcast_ref::<AggregateExchangeExec>()
+            .is_some()
         || plan
             .as_any()
             .downcast_ref::<CoalescePartitionsExec>()
@@ -872,6 +876,7 @@ fn add_roundrobin_on_top(
 /// A [`Result`] object that contains new execution plan where the desired
 /// distribution is satisfied by adding a Hash repartition.
 fn add_hash_on_top(
+    parent: &Arc<dyn ExecutionPlan>,
     input: DistributionContext,
     hash_exprs: Vec<Arc<dyn PhysicalExpr>>,
     n_target: usize,
@@ -883,7 +888,7 @@ fn add_hash_on_top(
         return Ok(input);
     }
 
-    let dist = Distribution::HashPartitioned(hash_exprs);
+    let dist = Distribution::HashPartitioned(hash_exprs.clone());
     let satisfaction = input.plan.output_partitioning().satisfaction(
         &dist,
         input.plan.equivalence_properties(),
@@ -901,23 +906,61 @@ fn add_hash_on_top(
     };
 
     if needs_repartition {
-        // When there is an existing ordering, we preserve ordering during
-        // repartition. This will be rolled back in the future if any of the
-        // following conditions is true:
-        // - Preserving ordering is not helpful in terms of satisfying ordering
-        //   requirements.
-        // - Usage of order preserving variants is not desirable (per the flag
-        //   `config.optimizer.prefer_existing_sort`).
-        let partitioning = dist.create_partitioning(n_target);
-        let repartition =
-            RepartitionExec::try_new(Arc::clone(&input.plan), partitioning)?
-                .with_preserve_order();
-        let plan = Arc::new(repartition) as _;
+        let plan: Arc<dyn ExecutionPlan> =
+            if should_use_aggregate_exchange(parent, &input.plan, &hash_exprs) {
+                Arc::new(AggregateExchangeExec::try_new(
+                    Arc::clone(&input.plan),
+                    hash_exprs.clone(),
+                    n_target,
+                )?)
+            } else {
+                // When there is an existing ordering, we preserve ordering during
+                // repartition. This will be rolled back in the future if any of the
+                // following conditions is true:
+                // - Preserving ordering is not helpful in terms of satisfying ordering
+                //   requirements.
+                // - Usage of order preserving variants is not desirable (per the flag
+                //   `config.optimizer.prefer_existing_sort`).
+                let partitioning = dist.create_partitioning(n_target);
+                Arc::new(
+                    RepartitionExec::try_new(Arc::clone(&input.plan), partitioning)?
+                        .with_preserve_order(),
+                )
+            };
 
         return Ok(DistributionContext::new(plan, true, vec![input]));
     }
 
     Ok(input)
+}
+
+fn should_use_aggregate_exchange(
+    parent: &Arc<dyn ExecutionPlan>,
+    child: &Arc<dyn ExecutionPlan>,
+    hash_exprs: &[Arc<dyn PhysicalExpr>],
+) -> bool {
+    let Some(final_agg) = parent.as_any().downcast_ref::<AggregateExec>() else {
+        return false;
+    };
+    if final_agg.mode() != &AggregateMode::FinalPartitioned
+        || final_agg.group_expr().is_empty()
+        || final_agg.group_expr().has_grouping_set()
+    {
+        return false;
+    }
+
+    let Some(partial_agg) = child.as_any().downcast_ref::<AggregateExec>() else {
+        return false;
+    };
+    if partial_agg.mode() != &AggregateMode::Partial
+        || partial_agg.group_expr().is_empty()
+        || partial_agg.group_expr().has_grouping_set()
+        || partial_agg.limit_options().is_some()
+    {
+        return false;
+    }
+
+    physical_exprs_equal(&partial_agg.output_group_expr(), hash_exprs)
 }
 
 /// Adds a [`SortPreservingMergeExec`] or a [`CoalescePartitionsExec`] operator
@@ -1324,6 +1367,7 @@ pub fn ensure_distribution(
                     // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
                     if hash_necessary {
                         child = add_hash_on_top(
+                            &plan,
                             child,
                             exprs.to_vec(),
                             target_partitions,

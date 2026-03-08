@@ -99,6 +99,17 @@ pub trait GroupValues: Send {
     /// assigned.
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()>;
 
+    /// Like [`GroupValues::intern`], but allows the caller to provide
+    /// precomputed combined group hashes for each input row.
+    fn intern_with_hashes(
+        &mut self,
+        cols: &[ArrayRef],
+        _hashes: &[u64],
+        groups: &mut Vec<usize>,
+    ) -> Result<()> {
+        self.intern(cols, groups)
+    }
+
     /// Returns the number of bytes of memory used by this [`GroupValues`]
     fn size(&self) -> usize;
 
@@ -110,6 +121,14 @@ pub trait GroupValues: Send {
 
     /// Emits the group values
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
+
+    /// Emits combined group hashes aligned with [`GroupValues::emit`].
+    ///
+    /// Implementations that do not retain per-group hashes can return `None`,
+    /// in which case callers may recompute hashes from the emitted arrays.
+    fn emit_group_hashes(&mut self, _emit_to: EmitTo) -> Result<Option<ArrayRef>> {
+        Ok(None)
+    }
 
     /// Clear the contents and shrink the capacity to the size of the batch (free up memory usage)
     fn clear_shrink(&mut self, num_rows: usize);
